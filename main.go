@@ -546,13 +546,18 @@ func buildCache() {
 
 	// Walk directories and send to workers
 	for _, base := range config.LibraryPaths {
-		filepath.WalkDir(base, func(path string, d os.DirEntry, err error) error {
+		logger.Info("Starting walk on base path: %s", base)
+		err := filepath.WalkDir(base, func(path string, d os.DirEntry, err error) error {
 			if err != nil {
+				logger.Error("❌ WalkDir error at path %s: %v", path, err)
 				return nil
 			}
 			workChan <- path
 			return nil
 		})
+		if err != nil {
+			logger.Error("❌ Failed to initiate walk on %s: %v", base, err)
+		}
 	}
 
 	close(workChan)
