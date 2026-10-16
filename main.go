@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"sort"
@@ -300,6 +301,31 @@ func isImageFile(name string) bool {
 		strings.HasSuffix(name, ".gif")
 }
 
+func pdfPageCount(path string) (int, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "pdfinfo", path).Output()
+	if err != nil {
+		return 0, fmt.Errorf("pdfinfo failed: %w", err)
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.HasPrefix(line, "Pages:") {
+			return strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "Pages:")))
+		}
+	}
+	return 0, fmt.Errorf("page count not found")
+}
+
+func renderPDFPage(path string, page, dpi int) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	thumbSemaphore <- struct{}{}
+	defer func() { <-thumbSemaphore }()
+	n := strconv.Itoa(page)
+	return exec.CommandContext(ctx, "pdftoppm", "-jpeg", "-jpegopt", "quality=85",
+		"-r", strconv.Itoa(dpi), "-f", n, "-l", n, "-singlefile", path, "-").Output()
+}
+
 // generateThumbnailBase64 creates a thumbnail from file path
 func generateThumbnailBase64(path string) (string, error) {
 	f, err := os.Open(path)
@@ -505,6 +531,51 @@ func processCBR(path string, existing map[string]string, seen map[string]bool, n
 	return newCount, updatedCount
 }
 
+func processPDF(path string, existing map[string]string, seen map[string]bool, newCount, updatedCount int) (int, int) {
+	info, err := os.Stat(path)
+	if err != nil {
+		logger.Error("Failed to stat PDF: %v", err)
+		return newCount, updatedCount
+	}
+	lastMod := info.ModTime().Format(time.RFC3339)
+	prevMod, exists := existing[path]
+	seen[path] = true
+
+	category := filepath.Base(filepath.Dir(path))
+	title := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+
+	var coverData string
+	if !exists || prevMod != lastMod {
+		data, err := renderPDFPage(path, 1, 72)
+		if err != nil {
+			logger.Error("Failed to render PDF cover %s: %v", path, err)
+		} else if img, _, err := image.Decode(bytes.NewReader(data)); err == nil {
+			coverData, _ = imageToThumbnailBase64(img, config.MaxThumbnailSize)
+		}
+	}
+
+	if exists {
+		if prevMod != lastMod {
+			_, err := db.Exec(`UPDATE library SET category=?, title=?, cover=?, coverData=?, lastModified=?, updated_at=CURRENT_TIMESTAMP WHERE path=?`,
+				category, title, "(pdf internal)", coverData, lastMod, path)
+			if err != nil {
+				logger.Error("Failed to update PDF entry: %v", err)
+			} else {
+				updatedCount++
+			}
+		}
+	} else {
+		_, err := db.Exec(`INSERT INTO library (category, title, path, cover, coverData, lastModified) VALUES (?, ?, ?, ?, ?, ?)`,
+			category, title, path, "(pdf internal)", coverData, lastMod)
+		if err != nil {
+			logger.Error("Failed to insert PDF entry: %v", err)
+		} else {
+			newCount++
+		}
+	}
+	return newCount, updatedCount
+}
+
 // buildCache scans library directories and updates cache
 func buildCache() {
 	logger.Info("🔄 Scanning libraries...")
@@ -609,6 +680,15 @@ func processPath(path string, existing map[string]string, seen map[string]bool, 
 		return
 	}
 
+	if strings.HasSuffix(lower, ".pdf") {
+		mu.Lock()
+		n, u := processPDF(path, existing, seen, *newCount, *updatedCount)
+		*newCount = n
+		*updatedCount = u
+		mu.Unlock()
+		return
+	}
+
 	// Handle directories with images
 	if !info.IsDir() {
 		return
@@ -693,6 +773,17 @@ func handleMedia(w http.ResponseWriter, r *http.Request) {
 	cbzPath := r.URL.Query().Get("cbz")
 	pageName := r.URL.Query().Get("page")
 
+	pdfPath := r.URL.Query().Get("pdf")
+	if pdfPath != "" && pageName != "" {
+		if !isPathAllowed(pdfPath) {
+			logger.Error("Unauthorized PDF access attempt: %s", pdfPath)
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		servePDFPage(w, pdfPath, pageName)
+		return
+	}
+
 	// Serve CBZ pages
 	if cbzPath != "" && pageName != "" {
 		if !isPathAllowed(cbzPath) {
@@ -736,6 +827,23 @@ func handleMedia(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.ServeFile(w, r, path)
+}
+
+func servePDFPage(w http.ResponseWriter, pdfPath, pageName string) {
+	page, err := strconv.Atoi(pageName)
+	if err != nil || page < 1 {
+		http.Error(w, "bad page", http.StatusBadRequest)
+		return
+	}
+	data, err := renderPDFPage(pdfPath, page, 110)
+	if err != nil || len(data) == 0 {
+		logger.Error("PDF render failed (%s p%d): %v", pdfPath, page, err)
+		http.Error(w, "cannot render page", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.Write(data)
 }
 
 // serveCBZPage serves a single page from CBZ archive
@@ -850,7 +958,7 @@ func handleLibrary(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// If coverData is missing, try to generate on demand
-		if item.CoverData == "" && item.Cover != "" && item.Cover != "(cbz internal)" && item.Cover != "(cbr internal)" {
+		if item.CoverData == "" && item.Cover != "" && item.Cover != "(cbz internal)" && item.Cover != "(cbr internal)" && item.Cover != "(pdf internal)" {
 			coverPath := filepath.Join(item.Path, item.Cover)
 			if data, err := generateThumbnailBase64(coverPath); err == nil {
 				item.CoverData = data
@@ -897,7 +1005,28 @@ func handlePages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if strings.HasSuffix(lower, ".pdf") {
+		handlePDFPages(w, path)
+		return
+	}
+
 	handleDirectoryPages(w, path)
+}
+
+func handlePDFPages(w http.ResponseWriter, path string) {
+	count, err := pdfPageCount(path)
+	if err != nil {
+		logger.Error("Cannot read PDF: %v", err)
+		http.Error(w, "cannot read pdf", http.StatusInternalServerError)
+		return
+	}
+	urls := make([]string, 0, count)
+	for i := 1; i <= count; i++ {
+		urls = append(urls, fmt.Sprintf("/media?pdf=%s&page=%d", url.QueryEscape(path), i))
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	json.NewEncoder(w).Encode(urls)
 }
 
 // handleCBZPages returns page URLs for CBZ file
@@ -1040,7 +1169,7 @@ func main() {
 		Addr:         addr,
 		Handler:      mux,
 		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		WriteTimeout: 60 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 
